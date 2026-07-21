@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
-const Anthropic = require('@anthropic-ai/sdk');
 
 const app = express();
 app.use(cors());
@@ -12,11 +11,7 @@ const supabase = createClient(
   process.env.SUPABASE_KEY
 );
 
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY
-});
-
-// 健康检查接口
+// 健康检查
 app.get('/', (req, res) => {
   res.json({ status: '服务正常 ♡' });
 });
@@ -76,7 +71,7 @@ app.get('/messages/:sessionId', async (req, res) => {
   }
 });
 
-// 发送消息（核心接口）
+// 核心对话接口（302.ai版）
 app.post('/chat', async (req, res) => {
   try {
     const { message, sessionId } = req.body;
@@ -117,15 +112,34 @@ app.post('/chat', async (req, res) => {
       content: m.content
     }));
 
-    // 调用Claude API
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 800,
-      system: systemPrompt,
-      messages: messages
+    const apiMessages = [
+      { role: 'system', content: systemPrompt },
+      ...messages
+    ];
+
+    // 调用 302.ai API
+    const response = await fetch('https://api.302.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.MAIN_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: 'gpt-3.5-turbo',
+        messages: apiMessages,
+        temperature: 0.7,
+        max_tokens: 800
+      })
     });
 
-    const reply = response.content[0].text;
+    if (!response.ok) {
+      const errorData = await response.json();
+      console.error('302.ai API 错误:', errorData);
+      throw new Error(errorData.error?.message || `HTTP ${response.status}`);
+    }
+
+    const data = await response.json();
+    const reply = data.choices[0].message.content;
 
     // 保存AI回复
     await supabase.from('messages').insert([{
@@ -136,15 +150,15 @@ app.post('/chat', async (req, res) => {
       created_at: new Date().toISOString()
     }]);
 
-    // 更新会话时间
     await supabase.from('sessions')
       .update({ updated_at: new Date().toISOString() })
       .eq('id', sessionId);
 
     res.json({ reply });
+
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
+    console.error('Chat 接口错误:', e);
+    res.status(500).json({ error: e.message || 'AI暂时走神了，再试一次 ♡' });
   }
 });
 
