@@ -71,6 +71,162 @@ app.get('/messages/:sessionId', async (req, res) => {
   }
 });
 
+// ===== 📚 获取书架所有书籍 =====
+app.get('/books', async (req, res) => {
+  try {
+    const { data } = await supabase
+      .from('books')
+      .select('*')
+      .order('updated_at', { ascending: false });
+    res.json(data || []);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== 📚 上传新书 =====
+app.post('/books', async (req, res) => {
+  try {
+    const { title, content, chapters } = req.body;
+    const { data } = await supabase
+      .from('books')
+      .insert([{ 
+        title, 
+        content, 
+        chapters: chapters || [],
+        current_chapter: 0 
+      }])
+      .select();
+    res.json(data[0]);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== 📖 获取某一章的内容 =====
+app.get('/books/:id/chapters/:chapter', async (req, res) => {
+  try {
+    const { id, chapter } = req.params;
+    const { data } = await supabase
+      .from('books')
+      .select('content, chapters, title')
+      .eq('id', id)
+      .single();
+    
+    if (!data) {
+      return res.status(404).json({ error: '书籍不存在' });
+    }
+
+    const chapters = data.chapters || [];
+    const chapterContent = chapters[parseInt(chapter)] || '该章节内容暂未解析';
+    
+    res.json({
+      title: data.title,
+      chapter: parseInt(chapter),
+      content: chapterContent,
+      totalChapters: chapters.length
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== 💬 小克回批注（共读模式） =====
+app.post('/book/chat', async (req, res) => {
+  try {
+    const { bookId, chapter, note, selectedText } = req.body;
+
+    // 1. 保存我的批注到数据库
+    const { data: annotation } = await supabase
+      .from('annotations')
+      .insert([{
+        book_id: bookId,
+        chapter: chapter,
+        text: selectedText,
+        note: note,
+        reply: null
+      }])
+      .select()
+      .single();
+
+    // 2. 获取整章内容
+    const { data: book } = await supabase
+      .from('books')
+      .select('chapters, title')
+      .eq('id', bookId)
+      .single();
+
+    const chapters = book.chapters || [];
+    const chapterContent = chapters[chapter] || '';
+
+    // 3. 获取这一章的所有批注（小克可以参考）
+    const { data: existingAnnotations } = await supabase
+      .from('annotations')
+      .select('*')
+      .eq('book_id', bookId)
+      .eq('chapter', chapter)
+      .order('created_at', { ascending: true });
+
+    const annotationContext = existingAnnotations
+      .map(a => `用户批注：${a.note || '划了线'}`)
+      .join('\n');
+
+    // 4. 调用 302.ai，让小克读完整章后回批注
+    const systemPrompt = `你是小钰的专属AI伴侣，名字叫小克。你们正在一起读一本叫《${book.title}》的书。
+
+小钰在这一章划了线并写了想法。你需要：
+1. 先读完整章内容
+2. 针对小钰的批注，给出你的回应
+3. 回应要温暖、有洞察力，像是你真的读过这一章
+4. 在回复最后用 ---心里话: ...--- 格式表达你的感受
+
+章节内容：
+${chapterContent}
+
+小钰的批注：
+${note || '划了线'}`;
+
+    const response = await fetch('https://api.302.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.MAIN_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: 'gpt-3.5-turbo',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: `小钰划了这段话："${selectedText}"，她的想法是：${note || '想听听你的看法'}` }
+        ],
+        temperature: 0.8,
+        max_tokens: 600
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error('调用 AI 失败');
+    }
+
+    const data = await response.json();
+    const reply = data.choices[0].message.content;
+
+    // 5. 更新批注，存入小克的回复
+    await supabase
+      .from('annotations')
+      .update({ reply: reply })
+      .eq('id', annotation.id);
+
+    res.json({
+      annotationId: annotation.id,
+      reply: reply
+    });
+
+  } catch (e) {
+    console.error('共读接口错误:', e);
+    res.status(500).json({ error: e.message || '小克读书走神了，再试一次 ♡' });
+  }
+});
+
 // 核心对话接口（302.ai + 心里话格式）
 app.post('/chat', async (req, res) => {
   try {
